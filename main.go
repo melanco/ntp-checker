@@ -1,11 +1,14 @@
 package main
 
 import (
-	"fmt"
-	"log"
+	"net/http"
+	"sync"
 	"time"
 
 	"github.com/beevik/ntp"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/zap"
 )
 
 // Liste des serveurs NTP à vérifier
@@ -17,22 +20,53 @@ var ntpServers = []string{
 	"fake.ntp.org",
 }
 
-// On prend le temps courant et on ajoute 10 minutes.
-const timeDifferenceThreshold = 10 * time.Minute
+var unreachableServers = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "ntp_unreachable_servers_total",
+		Help: "Total number of times NTP servers that couldn't be reached",
+	},
+	[]string{"server"},
+)
+
+func init() {
+	prometheus.MustRegister(unreachableServers)
+}
+
+func checkNTPServers(sugar *zap.SugaredLogger) {
+	var wg sync.WaitGroup
+
+	for _, server := range ntpServers {
+		wg.Add(1)
+
+		go func(server string) {
+			defer wg.Done()
+
+			ntpTime, err := ntp.Time(server)
+			if err != nil {
+				sugar.Infof("Je ne peux pas rejoindre: %s", server)
+				unreachableServers.WithLabelValues(server).Inc() // Increment the counter with server label
+				return
+			}
+			localTime := time.Now()
+			diff := localTime.Sub(ntpTime)
+			sugar.Infof("Difference de temps entre la machine local et %s: %v", server, diff)
+		}(server)
+	}
+
+	wg.Wait()
+}
 
 func main() {
-	for _, server := range ntpServers {
-		// On recoit le temps de chaque serveurs NTP
-		ntpTime, err := ntp.Time(server)
-		if err != nil {
-			log.Printf("Error fetching time from %s: %v", server, err)
-			continue
-		}
+	// Declaration du logging
+	logger, _ := zap.NewProduction()
+	defer logger.Sync()
+	sugar := logger.Sugar()
 
-		// On calcule la difference de temps entre le pod et le serveur NTP
-		localTime := time.Now()
-		diff := localTime.Sub(ntpTime)
+	http.Handle("/metrics", promhttp.Handler())
+	go http.ListenAndServe(":8080", nil) // Expose the metrics on port 8080
 
-		fmt.Printf("Time difference between local machine and %s: %v\n", server, diff)
+	for {
+		checkNTPServers(sugar)
+		time.Sleep(15 * time.Second)
 	}
 }
